@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -83,6 +84,38 @@ class JsonApplication:
                 return Response(200, self.service.approve_scenario(actor, parts[1], int(payload["expected_revision"])))
             if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "run":
                 return Response(200, self.service.run_scenario(actor, parts[1], payload["as_of_date"]))
+            if method == "POST" and path == "/construction/buildings":
+                return Response(201, self.service.register_building(actor, payload))
+            if method == "GET" and path == "/construction/buildings":
+                return Response(200, self.service.list_buildings(query.get("settlement_id", [""])[0]))
+            if method == "POST" and path == "/construction/services":
+                return Response(201, self.service.register_service(actor, payload))
+            if method == "GET" and path == "/construction/services":
+                return Response(200, self.service.list_services(query.get("settlement_id", [""])[0]))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["construction", "services"] and parts[3] == "revise":
+                return Response(200, self.service.revise_service(actor, parts[2], payload))
+            if method == "GET" and len(parts) == 4 and parts[:2] == ["construction", "services"] and parts[3] == "versions":
+                return Response(200, self.service.service_versions(parts[2]))
+            if method == "POST" and path == "/construction/changes":
+                return Response(201, self.service.submit_change(actor, payload))
+            if method == "GET" and len(parts) == 3 and parts[:2] == ["construction", "changes"]:
+                return Response(200, self.service.change(parts[2]))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["construction", "changes"] and parts[3] == "revise":
+                return Response(200, self.service.revise_change(actor, parts[2], int(payload["expected_revision"]), payload))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["construction", "changes"] and parts[3] == "decide":
+                return Response(200, self.service.decide_change(actor, parts[2], int(payload["expected_revision"]), payload["decision"], payload["reason"]))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["construction", "changes"] and parts[3] == "receipts":
+                return Response(201, self.service.record_receipt(actor, parts[2], payload["step_index"], payload["result"], payload["note"], payload.get("step_kind", "execution")))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["construction", "changes"] and parts[3] == "rollback":
+                return Response(200, self.service.begin_rollback(actor, parts[2], payload["note"]))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["construction", "changes"] and parts[3] == "takeover":
+                return Response(200, self.service.takeover_change(actor, parts[2], payload["note"]))
+            if method == "GET" and len(parts) == 4 and parts[:2] == ["construction", "changes"] and parts[3] == "assessment":
+                return Response(200, self.service.change_assessment(parts[2]))
+            if method == "GET" and len(parts) == 4 and parts[:2] == ["construction", "changes"] and parts[3] == "revisions":
+                return Response(200, self.service.change_revisions(parts[2]))
+            if method == "GET" and len(parts) == 4 and parts[:2] == ["construction", "changes"] and parts[3] == "explain":
+                return Response(200, self.service.explain_change(parts[2]))
             if method == "GET" and path == "/audit/chain":
                 return Response(200, self.service.audit_chain(actor))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
@@ -93,6 +126,8 @@ class JsonApplication:
 
 
 def make_handler(application: JsonApplication):
+    dispatch_lock = threading.Lock()
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "PowerDispatch/1"
 
@@ -105,7 +140,8 @@ def make_handler(application: JsonApplication):
         def _dispatch(self) -> None:
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length) if length else b""
-            response = application.handle(self.command, self.path, dict(self.headers.items()), body)
+            with dispatch_lock:
+                response = application.handle(self.command, self.path, dict(self.headers.items()), body)
             encoded = json.dumps(response.body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             self.send_response(response.status)
             self.send_header("Content-Type", "application/json; charset=utf-8")

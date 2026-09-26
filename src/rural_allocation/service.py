@@ -10,8 +10,27 @@ from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
+from .construction import (
+    REVISABLE_STATES,
+    Building,
+    ChangePayload,
+    PublicService,
+    ResourceApplication,
+    assess_constraints,
+    payload_diff,
+)
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import IndexQuote, Facility, InventoryLot, NominationRequest, Route, SupplyScenario
+from .models import (
+    IndexQuote,
+    Facility,
+    InventoryLot,
+    NominationRequest,
+    Route,
+    SupplyScenario,
+    decimal_value,
+    identifier,
+    required_text,
+)
 from .planning import (
     AllocationRequest,
     PricePoint,
@@ -31,9 +50,9 @@ from .storage import initialize, transaction
 
 
 ROLE_PERMISSIONS = {
-    "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run"},
-    "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write"},
-    "risk": {"outage.write", "scenario.approve", "report.read"},
+    "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run", "construction.write"},
+    "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write", "construction.receipt"},
+    "risk": {"outage.write", "scenario.approve", "report.read", "construction.write", "construction.approve"},
     "auditor": {"report.read", "audit.read"},
 }
 
@@ -569,3 +588,746 @@ class SupplyService:
                 break
             previous_hash = row["event_hash"]
         return {"valid": valid, "events": len(rows), "head_hash": previous_hash}
+
+    # ---- 安置片区施工变更影响审批 ----
+
+    def _settlement(self, settlement_id: str) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM facilities WHERE facility_id=?", (settlement_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("安置片区不存在")
+        if row["kind"] != "settlement":
+            raise ValidationFailed("目标设施不是安置片区")
+        return row
+
+    def register_building(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "catalog.write")
+        building = Building.from_dict(raw)
+        self._settlement(building.settlement_id)
+        try:
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "INSERT INTO construction_buildings(building_id,settlement_id,name,housing_units,floors,"
+                    "created_by,created_at) VALUES(?,?,?,?,?,?,?)",
+                    (
+                        building.building_id,
+                        building.settlement_id,
+                        building.name,
+                        building.housing_units,
+                        building.floors,
+                        actor_id,
+                        self._now(),
+                    ),
+                )
+                self._audit("construction_building", building.building_id, "building.registered", actor_id, raw)
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("楼栋编号已经存在") from exc
+        return self.building(building.building_id)
+
+    def building(self, building_id: str) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT * FROM construction_buildings WHERE building_id=?", (building_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("楼栋不存在")
+        return dict(row)
+
+    def list_buildings(self, settlement_id: str) -> dict[str, Any]:
+        self._settlement(settlement_id)
+        rows = self.connection.execute(
+            "SELECT * FROM construction_buildings WHERE settlement_id=? ORDER BY building_id",
+            (settlement_id,),
+        ).fetchall()
+        return {"settlement_id": settlement_id, "buildings": [dict(row) for row in rows]}
+
+    def register_service(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "catalog.write")
+        service = PublicService.from_dict(raw)
+        self._settlement(service.settlement_id)
+        note = required_text(raw.get("note", "初始登记"), "note")
+        try:
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "INSERT INTO construction_services(service_id,settlement_id,kind,capacity,unit,"
+                    "created_by,created_at) VALUES(?,?,?,?,?,?,?)",
+                    (
+                        service.service_id,
+                        service.settlement_id,
+                        service.kind,
+                        decimal_text(service.capacity),
+                        service.unit,
+                        actor_id,
+                        self._now(),
+                    ),
+                )
+                self.connection.execute(
+                    "INSERT INTO construction_service_versions(service_id,revision,capacity,unit,note,"
+                    "changed_by,changed_at) VALUES(?,?,?,?,?,?,?)",
+                    (service.service_id, 1, decimal_text(service.capacity), service.unit, note, actor_id, self._now()),
+                )
+                self._audit("construction_service", service.service_id, "service.registered", actor_id, raw)
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("公共服务编号或该片区的约束类型已经存在") from exc
+        return self.public_service(service.service_id)
+
+    def public_service(self, service_id: str) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT * FROM construction_services WHERE service_id=?", (service_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("公共服务不存在")
+        return dict(row)
+
+    def list_services(self, settlement_id: str) -> dict[str, Any]:
+        self._settlement(settlement_id)
+        rows = self.connection.execute(
+            "SELECT * FROM construction_services WHERE settlement_id=? ORDER BY kind",
+            (settlement_id,),
+        ).fetchall()
+        return {"settlement_id": settlement_id, "services": [dict(row) for row in rows]}
+
+    def service_versions(self, service_id: str) -> dict[str, Any]:
+        self.public_service(service_id)
+        rows = self.connection.execute(
+            "SELECT * FROM construction_service_versions WHERE service_id=? ORDER BY revision",
+            (service_id,),
+        ).fetchall()
+        return {"service_id": service_id, "versions": [dict(row) for row in rows]}
+
+    def revise_service(self, actor_id: str, service_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "catalog.write")
+        row = self.public_service(service_id)
+        capacity = decimal_value(raw.get("capacity"), "capacity", minimum=Decimal("0"))
+        unit = required_text(raw.get("unit"), "unit", 16)
+        note = required_text(raw.get("note"), "note")
+        expected = raw.get("expected_revision")
+        if isinstance(expected, bool) or not isinstance(expected, int) or expected != row["revision"]:
+            raise InvalidState("公共服务不是当前版本")
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE construction_services SET capacity=?,unit=?,revision=revision+1 "
+                "WHERE service_id=? AND revision=?",
+                (decimal_text(capacity), unit, service_id, row["revision"]),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("公共服务不是当前版本")
+            self.connection.execute(
+                "INSERT INTO construction_service_versions(service_id,revision,capacity,unit,note,"
+                "changed_by,changed_at) VALUES(?,?,?,?,?,?,?)",
+                (service_id, row["revision"] + 1, decimal_text(capacity), unit, note, actor_id, self._now()),
+            )
+            self._audit(
+                "construction_service",
+                service_id,
+                "service.revised",
+                actor_id,
+                {"revision": row["revision"] + 1, "note": note},
+            )
+        return self.public_service(service_id)
+
+    def _check_buildings(self, settlement_id: str, building_ids: Iterable[str]) -> None:
+        ids = tuple(building_ids)
+        placeholders = ",".join("?" for _ in ids)
+        rows = self.connection.execute(
+            f"SELECT building_id,settlement_id FROM construction_buildings WHERE building_id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        found = {row["building_id"]: row for row in rows}
+        for building_id in ids:
+            if building_id not in found:
+                raise NotFound(f"楼栋 {building_id} 不存在")
+            if found[building_id]["settlement_id"] != settlement_id:
+                raise Conflict(f"楼栋 {building_id} 不属于该安置片区")
+
+    def _facility_snapshot(
+        self,
+        settlement_id: str,
+        payload: ChangePayload,
+        exclude_change_id: str,
+    ) -> tuple[dict[str, Decimal], list[ResourceApplication], dict[str, Any]]:
+        services = self.connection.execute(
+            "SELECT * FROM construction_services WHERE settlement_id=? ORDER BY kind",
+            (settlement_id,),
+        ).fetchall()
+        buildings = self.connection.execute(
+            "SELECT * FROM construction_buildings WHERE settlement_id=? ORDER BY building_id",
+            (settlement_id,),
+        ).fetchall()
+        others = self.connection.execute(
+            "SELECT change_id,payload_json,priority,submitted_at FROM construction_changes "
+            "WHERE settlement_id=? AND state IN ('approved','in_progress') AND change_id<>? "
+            "ORDER BY priority,submitted_at,change_id",
+            (settlement_id, exclude_change_id),
+        ).fetchall()
+        start = parse_utc(payload.window_starts_at, "window.starts_at")
+        end = parse_utc(payload.window_ends_at, "window.ends_at")
+        applications: list[ResourceApplication] = []
+        application_rows: list[dict[str, Any]] = []
+        for row in others:
+            other = json.loads(row["payload_json"])
+            other_start = parse_utc(other["window"]["starts_at"], "window.starts_at")
+            other_end = parse_utc(other["window"]["ends_at"], "window.ends_at")
+            if other_start >= end or start >= other_end:
+                continue
+            demands = {kind: Decimal(value) for kind, value in other["demands"].items()}
+            applications.append(
+                ResourceApplication(row["change_id"], int(row["priority"]), row["submitted_at"], demands)
+            )
+            application_rows.append({
+                "change_id": row["change_id"],
+                "priority": int(row["priority"]),
+                "submitted_at": row["submitted_at"],
+                "window": other["window"],
+                "demands": other["demands"],
+            })
+        capacities = {row["kind"]: Decimal(row["capacity"]) for row in services}
+        snapshot = {
+            "settlement_id": settlement_id,
+            "taken_at": self._now(),
+            "services": [
+                {
+                    "service_id": row["service_id"],
+                    "kind": row["kind"],
+                    "capacity": row["capacity"],
+                    "unit": row["unit"],
+                    "revision": int(row["revision"]),
+                }
+                for row in services
+            ],
+            "buildings": [
+                {
+                    "building_id": row["building_id"],
+                    "name": row["name"],
+                    "housing_units": int(row["housing_units"]),
+                    "state": row["state"],
+                    "revision": int(row["revision"]),
+                }
+                for row in buildings
+            ],
+            "applications": application_rows,
+        }
+        return capacities, applications, snapshot
+
+    def _assessment_view(
+        self,
+        payload: ChangePayload,
+        capacities: Mapping[str, Decimal],
+        applications: list[ResourceApplication],
+    ) -> dict[str, Any]:
+        result = assess_constraints(capacities=capacities, applications=applications, demands=payload.demands)
+        placeholders = ",".join("?" for _ in payload.building_ids)
+        rows = self.connection.execute(
+            f"SELECT building_id,name,housing_units FROM construction_buildings "
+            f"WHERE building_id IN ({placeholders}) ORDER BY building_id",
+            tuple(payload.building_ids),
+        ).fetchall()
+        return {
+            "window": {"starts_at": payload.window_starts_at, "ends_at": payload.window_ends_at},
+            "affected_buildings": [
+                {
+                    "building_id": row["building_id"],
+                    "name": row["name"],
+                    "housing_units": int(row["housing_units"]),
+                }
+                for row in rows
+            ],
+            "affected_housing_units": sum(int(row["housing_units"]) for row in rows),
+            **result,
+        }
+
+    def _store_assessment(
+        self,
+        change_id: str,
+        revision: int,
+        snapshot: Mapping[str, Any],
+        snapshot_sha256: str,
+        assessment: Mapping[str, Any],
+    ) -> None:
+        self.connection.execute(
+            "INSERT INTO construction_assessments(change_id,revision,snapshot_json,snapshot_sha256,"
+            "result_json,created_at) VALUES(?,?,?,?,?,?)",
+            (change_id, revision, canonical_json(snapshot), snapshot_sha256, canonical_json(assessment), self._now()),
+        )
+
+    def submit_change(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "construction.write")
+        change_id = identifier(raw.get("change_id"), "change_id")
+        settlement_id = identifier(raw.get("settlement_id"), "settlement_id")
+        self._settlement(settlement_id)
+        payload = ChangePayload.from_dict(raw)
+        canonical = payload.canonical()
+        with transaction(self.connection, immediate=True):
+            self._check_buildings(settlement_id, payload.building_ids)
+            capacities, applications, snapshot = self._facility_snapshot(settlement_id, payload, change_id)
+            assessment = self._assessment_view(payload, capacities, applications)
+            snapshot_sha256 = digest(snapshot)
+            try:
+                self.connection.execute(
+                    "INSERT INTO construction_changes(change_id,settlement_id,title,payload_json,state,revision,"
+                    "rollback_round,priority,submitted_by,revised_by,submitted_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        change_id,
+                        settlement_id,
+                        payload.title,
+                        canonical_json(canonical),
+                        "pending_review",
+                        1,
+                        0,
+                        payload.priority,
+                        actor_id,
+                        actor_id,
+                        self._now(),
+                        self._now(),
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise Conflict("施工变更编号已经存在") from exc
+            self.connection.execute(
+                "INSERT INTO construction_change_revisions(change_id,revision,payload_json,diff_json,"
+                "supersedes_revision_id,actor_id,created_at) VALUES(?,?,?,?,?,?,?)",
+                (
+                    change_id,
+                    1,
+                    canonical_json(canonical),
+                    canonical_json(payload_diff({}, canonical)),
+                    None,
+                    actor_id,
+                    self._now(),
+                ),
+            )
+            self._store_assessment(change_id, 1, snapshot, snapshot_sha256, assessment)
+            self._audit(
+                "construction_change",
+                change_id,
+                "change.submitted",
+                actor_id,
+                {"revision": 1, "snapshot_sha256": snapshot_sha256},
+            )
+        return {
+            "change_id": change_id,
+            "state": "pending_review",
+            "revision": 1,
+            "snapshot_sha256": snapshot_sha256,
+            "assessment": assessment,
+        }
+
+    def revise_change(
+        self,
+        actor_id: str,
+        change_id: str,
+        expected_revision: int,
+        raw: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        self._require(actor_id, "construction.write")
+        row = self.connection.execute(
+            "SELECT * FROM construction_changes WHERE change_id=?", (change_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("施工变更不存在")
+        if int(row["revision"]) != expected_revision:
+            raise InvalidState("变更不是当前版本")
+        if row["state"] not in REVISABLE_STATES:
+            raise InvalidState("当前状态不能修订施工变更")
+        payload = ChangePayload.from_dict(raw)
+        canonical = payload.canonical()
+        diff = payload_diff(json.loads(row["payload_json"]), canonical)
+        if not diff:
+            raise ValidationFailed("修订必须包含与上一版的差异")
+        new_revision = int(row["revision"]) + 1
+        with transaction(self.connection, immediate=True):
+            self._check_buildings(row["settlement_id"], payload.building_ids)
+            capacities, applications, snapshot = self._facility_snapshot(row["settlement_id"], payload, change_id)
+            assessment = self._assessment_view(payload, capacities, applications)
+            snapshot_sha256 = digest(snapshot)
+            cursor = self.connection.execute(
+                "UPDATE construction_changes SET title=?,payload_json=?,state='pending_review',revision=?,"
+                "failure_reason=NULL,priority=?,revised_by=?,updated_at=? WHERE change_id=? AND revision=?",
+                (
+                    payload.title,
+                    canonical_json(canonical),
+                    new_revision,
+                    payload.priority,
+                    actor_id,
+                    self._now(),
+                    change_id,
+                    expected_revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("变更不是当前版本")
+            previous = self.connection.execute(
+                "SELECT revision_id FROM construction_change_revisions WHERE change_id=? AND revision=?",
+                (change_id, expected_revision),
+            ).fetchone()
+            self.connection.execute(
+                "INSERT INTO construction_change_revisions(change_id,revision,payload_json,diff_json,"
+                "supersedes_revision_id,actor_id,created_at) VALUES(?,?,?,?,?,?,?)",
+                (
+                    change_id,
+                    new_revision,
+                    canonical_json(canonical),
+                    canonical_json(diff),
+                    previous["revision_id"],
+                    actor_id,
+                    self._now(),
+                ),
+            )
+            self._store_assessment(change_id, new_revision, snapshot, snapshot_sha256, assessment)
+            self._audit(
+                "construction_change",
+                change_id,
+                "change.revised",
+                actor_id,
+                {"revision": new_revision, "diff": diff, "snapshot_sha256": snapshot_sha256},
+            )
+        return {
+            "change_id": change_id,
+            "state": "pending_review",
+            "revision": new_revision,
+            "diff": diff,
+            "snapshot_sha256": snapshot_sha256,
+            "assessment": assessment,
+        }
+
+    def decide_change(
+        self,
+        actor_id: str,
+        change_id: str,
+        expected_revision: int,
+        decision: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        self._require(actor_id, "construction.approve")
+        if decision not in {"approved", "rejected"}:
+            raise ValidationFailed("decision 必须是 approved 或 rejected")
+        reason_text = required_text(reason, "reason")
+        row = self.connection.execute(
+            "SELECT * FROM construction_changes WHERE change_id=?", (change_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("施工变更不存在")
+        if actor_id == row["revised_by"]:
+            raise Forbidden("施工窗口、资源冻结及回退方案必须由他人整体审批")
+        if row["state"] != "pending_review" or int(row["revision"]) != expected_revision:
+            raise InvalidState("变更不是当前待审版本")
+        payload = json.loads(row["payload_json"])
+        scope = {
+            "window": payload["window"],
+            "freeze": {"demands": payload["demands"], "building_ids": payload["building_ids"]},
+            "rollback_plan": payload["rollback_plan"],
+        }
+        scope_sha256 = digest(scope)
+        with transaction(self.connection, immediate=True):
+            self.connection.execute(
+                "INSERT INTO construction_approvals(change_id,revision,decision,scope_json,scope_sha256,"
+                "reason,decided_by,decided_at) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    change_id,
+                    expected_revision,
+                    decision,
+                    canonical_json(scope),
+                    scope_sha256,
+                    reason_text,
+                    actor_id,
+                    self._now(),
+                ),
+            )
+            cursor = self.connection.execute(
+                "UPDATE construction_changes SET state=?,updated_at=? "
+                "WHERE change_id=? AND revision=? AND state='pending_review'",
+                (decision, self._now(), change_id, expected_revision),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("变更不是当前待审版本")
+            self._audit(
+                "construction_change",
+                change_id,
+                "change.decided",
+                actor_id,
+                {"revision": expected_revision, "decision": decision, "scope_sha256": scope_sha256},
+            )
+        return {
+            "change_id": change_id,
+            "state": decision,
+            "revision": expected_revision,
+            "scope_sha256": scope_sha256,
+        }
+
+    def record_receipt(
+        self,
+        actor_id: str,
+        change_id: str,
+        step_index: object,
+        result: str,
+        note: str,
+        step_kind: str = "execution",
+    ) -> dict[str, Any]:
+        self._require(actor_id, "construction.receipt")
+        if step_kind not in {"execution", "rollback"}:
+            raise ValidationFailed("step_kind 必须是 execution 或 rollback")
+        if result not in {"done", "failed"}:
+            raise ValidationFailed("result 必须是 done 或 failed")
+        note_text = required_text(note, "note")
+        row = self.connection.execute(
+            "SELECT * FROM construction_changes WHERE change_id=?", (change_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("施工变更不存在")
+        payload = json.loads(row["payload_json"])
+        if step_kind == "execution":
+            if row["state"] not in ("approved", "in_progress"):
+                raise InvalidState("当前状态不能记录施工回执")
+            steps = payload["steps"]
+            attempt = 0
+        else:
+            if row["state"] != "rolling_back":
+                raise InvalidState("只有回退中的变更可以记录回退回执")
+            steps = payload["rollback_plan"]["steps"]
+            attempt = int(row["rollback_round"])
+        if (
+            isinstance(step_index, bool)
+            or not isinstance(step_index, int)
+            or not 0 <= step_index < len(steps)
+        ):
+            raise ValidationFailed("step_index 超出步骤范围")
+        revision = int(row["revision"])
+        done = self.connection.execute(
+            "SELECT COUNT(*) AS c FROM construction_receipts WHERE change_id=? AND revision=? "
+            "AND step_kind=? AND attempt=? AND result='done'",
+            (change_id, revision, step_kind, attempt),
+        ).fetchone()["c"]
+        if step_index != done:
+            raise InvalidState(f"现场回执必须逐步推进，下一步应为第 {done} 步")
+        with transaction(self.connection, immediate=True):
+            self.connection.execute(
+                "INSERT INTO construction_receipts(change_id,revision,attempt,step_kind,step_index,step_text,"
+                "result,note,recorded_by,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    change_id,
+                    revision,
+                    attempt,
+                    step_kind,
+                    step_index,
+                    steps[step_index],
+                    result,
+                    note_text,
+                    actor_id,
+                    self._now(),
+                ),
+            )
+            if result == "failed":
+                new_state = "failed"
+                cursor = self.connection.execute(
+                    "UPDATE construction_changes SET state='failed',failure_reason=?,updated_at=? "
+                    "WHERE change_id=? AND revision=?",
+                    (note_text, self._now(), change_id, revision),
+                )
+            elif step_index == len(steps) - 1:
+                new_state = "completed" if step_kind == "execution" else "rolled_back"
+                cursor = self.connection.execute(
+                    "UPDATE construction_changes SET state=?,updated_at=? WHERE change_id=? AND revision=?",
+                    (new_state, self._now(), change_id, revision),
+                )
+            else:
+                new_state = "in_progress" if step_kind == "execution" else "rolling_back"
+                cursor = self.connection.execute(
+                    "UPDATE construction_changes SET state=?,updated_at=? WHERE change_id=? AND revision=?",
+                    (new_state, self._now(), change_id, revision),
+                )
+            if cursor.rowcount != 1:
+                raise InvalidState("变更状态已变化，请刷新后重试")
+            self._audit(
+                "construction_change",
+                change_id,
+                "receipt.recorded",
+                actor_id,
+                {
+                    "revision": revision,
+                    "attempt": attempt,
+                    "step_kind": step_kind,
+                    "step_index": step_index,
+                    "result": result,
+                },
+            )
+        return {
+            "change_id": change_id,
+            "state": new_state,
+            "revision": revision,
+            "step_kind": step_kind,
+            "step_index": step_index,
+            "result": result,
+        }
+
+    def begin_rollback(self, actor_id: str, change_id: str, note: str) -> dict[str, Any]:
+        self._require(actor_id, "construction.receipt")
+        note_text = required_text(note, "note")
+        row = self.connection.execute(
+            "SELECT * FROM construction_changes WHERE change_id=?", (change_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("施工变更不存在")
+        if row["state"] != "failed":
+            raise InvalidState("只有失败的变更可以转入回退")
+        rollback_round = int(row["rollback_round"]) + 1
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE construction_changes SET state='rolling_back',rollback_round=?,updated_at=? "
+                "WHERE change_id=? AND state='failed'",
+                (rollback_round, self._now(), change_id),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("只有失败的变更可以转入回退")
+            self._audit(
+                "construction_change",
+                change_id,
+                "change.rollback_started",
+                actor_id,
+                {"round": rollback_round, "note": note_text},
+            )
+        return {"change_id": change_id, "state": "rolling_back", "rollback_round": rollback_round}
+
+    def takeover_change(self, actor_id: str, change_id: str, note: str) -> dict[str, Any]:
+        self._require(actor_id, "construction.receipt")
+        note_text = required_text(note, "note")
+        row = self.connection.execute(
+            "SELECT * FROM construction_changes WHERE change_id=?", (change_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("施工变更不存在")
+        if row["state"] not in ("failed", "rolling_back"):
+            raise InvalidState("只有失败或回退中的变更可以人工接管")
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE construction_changes SET state='manual_takeover',updated_at=? "
+                "WHERE change_id=? AND state IN ('failed','rolling_back')",
+                (self._now(), change_id),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("只有失败或回退中的变更可以人工接管")
+            self._audit(
+                "construction_change",
+                change_id,
+                "change.manual_takeover",
+                actor_id,
+                {"note": note_text},
+            )
+        return {"change_id": change_id, "state": "manual_takeover"}
+
+    def change(self, change_id: str) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT * FROM construction_changes WHERE change_id=?", (change_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("施工变更不存在")
+        result = dict(row)
+        result["payload"] = json.loads(result.pop("payload_json"))
+        return result
+
+    def change_assessment(self, change_id: str) -> dict[str, Any]:
+        self.change(change_id)
+        row = self.connection.execute(
+            "SELECT * FROM construction_assessments WHERE change_id=? ORDER BY revision DESC LIMIT 1",
+            (change_id,),
+        ).fetchone()
+        if row is None:
+            raise NotFound("影响评估不存在")
+        return {
+            "change_id": change_id,
+            "revision": int(row["revision"]),
+            "snapshot_sha256": row["snapshot_sha256"],
+            "snapshot": json.loads(row["snapshot_json"]),
+            "result": json.loads(row["result_json"]),
+            "created_at": row["created_at"],
+        }
+
+    def change_revisions(self, change_id: str) -> dict[str, Any]:
+        self.change(change_id)
+        rows = self.connection.execute(
+            "SELECT * FROM construction_change_revisions WHERE change_id=? ORDER BY revision",
+            (change_id,),
+        ).fetchall()
+        return {
+            "change_id": change_id,
+            "revisions": [
+                {
+                    "revision": int(row["revision"]),
+                    "diff": json.loads(row["diff_json"]),
+                    "payload": json.loads(row["payload_json"]),
+                    "supersedes_revision_id": row["supersedes_revision_id"],
+                    "actor_id": row["actor_id"],
+                    "created_at": row["created_at"],
+                }
+                for row in rows
+            ],
+        }
+
+    def explain_change(self, change_id: str) -> dict[str, Any]:
+        change = self.change(change_id)
+        assessment = self.change_assessment(change_id)
+        approvals = [
+            dict(row)
+            for row in self.connection.execute(
+                "SELECT * FROM construction_approvals WHERE change_id=? ORDER BY approval_id",
+                (change_id,),
+            ).fetchall()
+        ]
+        for approval in approvals:
+            approval["scope"] = json.loads(approval.pop("scope_json"))
+        receipts = [
+            dict(row)
+            for row in self.connection.execute(
+                "SELECT * FROM construction_receipts WHERE change_id=? ORDER BY receipt_id",
+                (change_id,),
+            ).fetchall()
+        ]
+        revisions = self.change_revisions(change_id)["revisions"]
+        basis: list[str] = []
+        result = assessment["result"]
+        for constraint in result["constraints"]:
+            if constraint["required"] == "0.000" and constraint["committed"] == "0.000":
+                continue
+            line = (
+                f"{constraint['label']}：容量 {constraint['capacity']}，"
+                f"既有申请占用 {constraint['committed']}，本次需求 {constraint['required']}，"
+                f"剩余 {constraint['remaining']}"
+            )
+            if constraint["displaced"]:
+                targets = "、".join(
+                    f"{item['change_id']}({item['displaced']})" for item in constraint["displaced"]
+                )
+                line += f"，挤占既有申请 {targets}"
+            if not constraint["feasible_after_displacement"]:
+                line += "，即使挤占全部既有申请仍不可行"
+            basis.append(line)
+        for approval in approvals:
+            decision_label = "批准" if approval["decision"] == "approved" else "驳回"
+            basis.append(
+                f"{approval['decided_by']} 于 {approval['decided_at']} 将第 {approval['revision']} 版的"
+                f"施工窗口、资源冻结与回退方案作为整体{decision_label}，"
+                f"范围哈希 {approval['scope_sha256']}，理由：{approval['reason']}"
+            )
+        for receipt in receipts:
+            kind_label = "施工" if receipt["step_kind"] == "execution" else f"回退第{receipt['attempt']}轮"
+            result_label = "完成" if receipt["result"] == "done" else "失败"
+            basis.append(
+                f"第 {receipt['revision']} 版{kind_label}第 {receipt['step_index']} 步"
+                f"（{receipt['step_text']}）{result_label}：{receipt['note']}，"
+                f"记录人 {receipt['recorded_by']}"
+            )
+        if change["failure_reason"]:
+            basis.append(f"失败原因：{change['failure_reason']}")
+        basis.append(f"当前状态：{change['state']}，当前版本：{change['revision']}")
+        return {
+            "change_id": change_id,
+            "state": change["state"],
+            "revision": change["revision"],
+            "snapshot_sha256": assessment["snapshot_sha256"],
+            "snapshot_taken_at": assessment["snapshot"]["taken_at"],
+            "assessment": result,
+            "approvals": approvals,
+            "receipts": receipts,
+            "revisions": revisions,
+            "decision_basis": basis,
+        }

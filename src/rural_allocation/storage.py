@@ -194,11 +194,125 @@ CREATE TABLE IF NOT EXISTS supply_audit_events (
 
 CREATE INDEX IF NOT EXISTS idx_supply_audit_entity
 ON supply_audit_events(entity_type, entity_id, event_id);
+
+CREATE TABLE IF NOT EXISTS construction_buildings (
+    building_id TEXT PRIMARY KEY,
+    settlement_id TEXT NOT NULL REFERENCES facilities(facility_id),
+    name TEXT NOT NULL,
+    housing_units INTEGER NOT NULL CHECK(housing_units > 0),
+    floors INTEGER NOT NULL CHECK(floors > 0),
+    state TEXT NOT NULL DEFAULT 'planned'
+        CHECK(state IN ('planned','under_construction','completed','retired')),
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_construction_buildings_settlement
+ON construction_buildings(settlement_id, building_id);
+
+CREATE TABLE IF NOT EXISTS construction_services (
+    service_id TEXT PRIMARY KEY,
+    settlement_id TEXT NOT NULL REFERENCES facilities(facility_id),
+    kind TEXT NOT NULL CHECK(kind IN ('housing','water','seats','road','fire')),
+    capacity TEXT NOT NULL,
+    unit TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    UNIQUE(settlement_id, kind)
+);
+
+CREATE TABLE IF NOT EXISTS construction_service_versions (
+    version_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    service_id TEXT NOT NULL REFERENCES construction_services(service_id),
+    revision INTEGER NOT NULL,
+    capacity TEXT NOT NULL,
+    unit TEXT NOT NULL,
+    note TEXT NOT NULL,
+    changed_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    changed_at TEXT NOT NULL,
+    UNIQUE(service_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS construction_changes (
+    change_id TEXT PRIMARY KEY,
+    settlement_id TEXT NOT NULL REFERENCES facilities(facility_id),
+    title TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending_review'
+        CHECK(state IN ('pending_review','approved','rejected','in_progress','failed',
+                        'rolling_back','rolled_back','manual_takeover','completed')),
+    revision INTEGER NOT NULL DEFAULT 1,
+    rollback_round INTEGER NOT NULL DEFAULT 0,
+    failure_reason TEXT,
+    priority INTEGER NOT NULL,
+    submitted_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    revised_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    submitted_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_construction_changes_settlement
+ON construction_changes(settlement_id, state);
+
+CREATE TABLE IF NOT EXISTS construction_change_revisions (
+    revision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    change_id TEXT NOT NULL REFERENCES construction_changes(change_id),
+    revision INTEGER NOT NULL,
+    payload_json TEXT NOT NULL,
+    diff_json TEXT NOT NULL,
+    supersedes_revision_id INTEGER REFERENCES construction_change_revisions(revision_id),
+    actor_id TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    UNIQUE(change_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS construction_assessments (
+    assessment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    change_id TEXT NOT NULL REFERENCES construction_changes(change_id),
+    revision INTEGER NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    snapshot_sha256 TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(change_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS construction_approvals (
+    approval_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    change_id TEXT NOT NULL REFERENCES construction_changes(change_id),
+    revision INTEGER NOT NULL,
+    decision TEXT NOT NULL CHECK(decision IN ('approved','rejected')),
+    scope_json TEXT NOT NULL,
+    scope_sha256 TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    decided_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    decided_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_construction_approvals_change
+ON construction_approvals(change_id, revision);
+
+CREATE TABLE IF NOT EXISTS construction_receipts (
+    receipt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    change_id TEXT NOT NULL REFERENCES construction_changes(change_id),
+    revision INTEGER NOT NULL,
+    attempt INTEGER NOT NULL DEFAULT 0,
+    step_kind TEXT NOT NULL CHECK(step_kind IN ('execution','rollback')),
+    step_index INTEGER NOT NULL,
+    step_text TEXT NOT NULL,
+    result TEXT NOT NULL CHECK(result IN ('done','failed')),
+    note TEXT NOT NULL,
+    recorded_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    recorded_at TEXT NOT NULL,
+    UNIQUE(change_id, revision, step_kind, attempt, step_index)
+);
 """
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")
